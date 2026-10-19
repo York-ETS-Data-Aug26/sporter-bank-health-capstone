@@ -1,0 +1,37 @@
+# PostgreSQL 17 for the Bank Health capstone.
+#
+#   docker compose up -d          start the database
+#   docker compose down           stop it (data persists in the pgdata volume)
+#   docker compose down -v        stop it and wipe the data
+#   docker compose exec db psql -U capstone -d bank_health
+#
+# Connection string (Python, psql, Power BI):
+#   host=localhost port=5432 dbname=bank_health user=capstone password=capstone
+#
+# capstone_data/ is mounted read-only at /data inside the container, so a
+# server-side COPY can read '/data/raw/<file>' directly. Client-side \copy
+# from psql works without the mount.
+
+services:
+  db:
+    image: postgres:17
+    container_name: bank_health_db
+    environment:
+      POSTGRES_USER: capstone
+      POSTGRES_PASSWORD: capstone
+      POSTGRES_DB: bank_health
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./cleaned_data:/cleaned_data
+      - ./sql:/sql:ro
+#      - ./capstone_data:/data:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U capstone -d bank_health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:
