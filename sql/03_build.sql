@@ -1,7 +1,7 @@
 \set ON_ERROR_STOP on
 SET client_min_messages = warning;
 
-DROP SCHEMA IF EXISTS mart CASCADE;
+DROP SCHEMA mart CASCADE;
 CREATE SCHEMA IF NOT EXISTS mart;
 
 SET search_path TO mart;
@@ -37,12 +37,24 @@ CREATE TABLE dim_date (
 
 WITH bounds AS (
 	SELECT
-		date '2006-01-01' AS start_date,
-		COALESCE (
-			max(repdte),
-			date '2026-06-30'
-			) AS end_date
-	FROM warehouse.financial_observation
+		date '1934-01-01' AS start_date,
+		GREATEST(
+			COALESCE (
+				(SELECT max(repdte)
+				FROM warehouse.financial_observation fo ),
+				date '2026-06-30'
+			),
+			COALESCE (
+				(SELECT max(fe.failure_date )
+				FROM warehouse.failure_event fe ),
+				date '2006-06-30'
+			),
+			COALESCE (
+				(SELECT max(c.date_received )
+				FROM warehouse.complaint c ),
+				date '2006-06-30'
+			)
+		)AS end_date
 ),
 calendar AS (
 	SELECT g::date AS d
@@ -84,7 +96,8 @@ SELECT
 		+ INTERVAL '3 months'
 		- INTERVAL '1 day'
 		)::date
-FROM calendar;
+FROM calendar
+ON CONFLICT (date_key) DO NOTHING;
 
 CREATE TABLE dim_bank(
 	bank_key bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -117,7 +130,8 @@ SELECT
 	i.active
 FROM warehouse.institution i
 LEFT JOIN warehouse.charter_class cc
-	ON cc.charter_class_id = i.charter_class_id;
+	ON cc.charter_class_id = i.charter_class_id
+WHERE i.holding_company_id IS NOT NULL;
 
 INSERT INTO dim_bank(
 	bank_entity_type,
@@ -386,11 +400,12 @@ SELECT
 	fm.mortgate30us ,
 	fm.dgs10
 FROM warehouse.financial_observation fo
-JOIN mart.dim_bank db
-	ON db.bank_entity_type = 'charter'
-	AND db.cert = fo.cert
+LEFT JOIN mart.dim_bank db
+	ON  db.cert = fo.cert
 LEFT JOIN warehouse.fred_macro fm
-	ON fm.quarter_end = fo.repdte ;
+	ON fm.quarter_end = fo.repdte
+WHERE db.bank_entity_type = 'charter'
+	AND fo.cert = db.cert ;
 
 INSERT INTO fact_bank_quarter (
 	bank_key,
@@ -443,11 +458,12 @@ SELECT
 FROM warehouse.financial_observation fo
 JOIN warehouse.institution i
 	ON i.cert = fo.cert
-JOIN mart.dim_bank db
+LEFT JOIN mart.dim_bank db
 	ON db.bank_entity_type = 'holding_company'
 	AND db.holding_company_id = i.holding_company_id
 LEFT JOIN warehouse.fred_macro fm
 	ON fm.quarter_end = fo.repdte
+WHERE db.bank_key IS NOT NULL
 GROUP BY db.bank_key , fo.repdte ;
 
 CREATE TABLE fact_industry_quarter (
@@ -463,6 +479,7 @@ CREATE TABLE fact_industry_quarter (
 	mortgage30us NUMERIC (12,6),
 	dgs10 NUMERIC (12,6)
 	);
+
 
 WITH financial_summary AS (
 	SELECT
@@ -514,5 +531,52 @@ LEFT JOIN complaint_summary cs
 LEFT JOIN warehouse.fred_macro m
 	ON m.quarter_end = FS.repdte;
 
-COMMIT;
+CREATE TABLE fact_failure (
+	failure_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+	failure_date_key integer REFERENCES mart.dim_date (date_key),
+	bank_key bigint REFERENCES mart.dim_bank (bank_key),
+	institution_name text,
+	resolution_date date,
+	qbfasset NUMERIC (20,3),
+	qbfdep NUMERIC (20,3),
+	COST NUMERIC (20,3),
+	uninsdep NUMERIC (20,3)
+);
 
+INSERT INTO fact_failure (
+	failure_date_key,
+	bank_key,
+	institution_name,
+	resolution_date,
+	qbfasset,
+	qbfdep,
+	COST,
+	uninsdep)
+SELECT
+	to_char(fe.failure_date, 'YYYYMMDD')::integer,
+	db.bank_key ,
+	fe.institution_name ,
+	fe.resolution_date ,
+	fe.qbfasset ,
+	fe.qbfdep ,
+	fe."cost" ,
+	fe.uninsdep
+FROM warehouse.failure_event fe
+LEFT JOIN mart.dim_bank db
+	ON db.bank_entity_type = 'charter'
+	AND db.cert = fe.cert ;
+
+ALTER TABLE dim_bank
+ADD COLUMN parent_bank_key bigint REFERENCES dim_bank(bank_key);
+
+UPDATE mart.dim_bank db
+SET parent_bank_key = db.bank_key
+FROM warehouse.institution i
+JOIN mart.dim_bank db2
+	ON db2.bank_entity_type = 'holding_company'
+	AND db2.holding_company_id = i.holding_company_id
+WHERE db.bank_entity_type = 'charter'
+	AND db.cert = i.cert
+	AND db.holding_company_id IS NOT NULL ;
+
+COMMIT;
