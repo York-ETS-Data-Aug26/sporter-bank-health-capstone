@@ -4,6 +4,8 @@ SET client_min_messages = warning;
 DROP SCHEMA mart CASCADE;
 CREATE SCHEMA IF NOT EXISTS mart;
 
+-- tables for mart as to be able to store data used regularly
+
 SET search_path TO mart;
 
 BEGIN;
