@@ -7,10 +7,6 @@
 #
 # Connection string (Python, psql, Power BI):
 #   host=localhost port=5432 dbname=bank_health user=capstone password=capstone
-#
-# capstone_data/ is mounted read-only at /data inside the container, so a
-# server-side COPY can read '/data/raw/<file>' directly. Client-side \copy
-# from psql works without the mount.
 
 services:
   db:
