@@ -2,13 +2,14 @@ Repository for fdic, cfpb, and fred records
 
 ## Setup
 
-Create a `raw_data` folder inside the repository and place data there (8 files)
+
 
 In terminal
 ```commandline
 pip install sqlalchemy
 ```
 
+Create a `raw_data` folder inside the repository and place data there (8 files)
 ```terminaloutput
 raw_data/
     cfpb_complaints.csv
