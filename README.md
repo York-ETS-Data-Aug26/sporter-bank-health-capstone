@@ -29,9 +29,11 @@ To run cleaning and sql scripts
 docker compose up -d
 python python/01_clean.py
 
-// analysis queries
+
 docker compose exec db psql -U capstone -d bank_health -f /sql/02_build.sql
 docker compose exec db psql -U capstone -d bank_health -f /sql/03_build.sql
+
+// analysis queries
 docker compose exec db psql -U capstone -d bank_health -f /sql/05_build.sql 
 ```
 
