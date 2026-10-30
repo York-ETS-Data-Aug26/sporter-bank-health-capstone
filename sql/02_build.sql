@@ -3,7 +3,7 @@ SET client_min_messages = warning;
 
 BEGIN;
 
-DROP SCHEMA IF EXISTS warehouse CASCADE;
+DROP SCHEMA warehouse CASCADE;
 CREATE SCHEMA IF NOT EXISTS warehouse;
 
 SET search_path TO warehouse;
@@ -55,8 +55,8 @@ CREATE TABLE institution (
 	);
 
 CREATE TABLE financial_observation(
-	cert varchar(20) NOT NULL REFERENCES institution(cert),
-	repdte date NOT NULL,
+	cert varchar(20) NOT NULL,
+	quarter_date date NOT NULL,
 	fiscal_year SMALLINT,
 	fiscal_quarter SMALLINT NOT NULL
 		CHECK (fiscal_quarter BETWEEN 1 AND 4),
@@ -78,9 +78,9 @@ CREATE TABLE financial_observation(
 	total_assets NUMERIC (20,3),
 	total_deposits NUMERIC (20,3),
 
-	CONSTRAINT financial_observation_pk PRIMARY KEY (cert, repdte),
+	CONSTRAINT financial_observation_pk PRIMARY KEY (cert, quarter_date),
 	CONSTRAINT fiancial_observation_quarter_end CHECK (
-		repdte = ( date_trunc('quarter', repdte)::date + INTERVAL '3 months' - INTERVAL '1 day')::date)) ;
+		quarter_date = ( date_trunc('quarter', quarter_date)::date + INTERVAL '3 months' - INTERVAL '1 day')::date)) ;
 
 
 CREATE TABLE failure_event (
@@ -110,7 +110,7 @@ CREATE TABLE company_bank_match (
 	company_id bigint PRIMARY KEY REFERENCES cfpb_company(company_id),
 	institution_cert varchar(20) REFERENCES institution(cert),
 	holding_company_id bigint REFERENCES holding_company(holding_company_id),
-	match_method varchar(20) NOT NULL CHECK (match_method IN ('exact', 'rule', 'manual', 'unmatched')),
+	match_method varchar(20) NOT NULL CHECK (match_method IN ('exact', 'suffix_stripped','unmatched', 'manual_override')),
 	unmatched_category varchar(30)
 );
 
@@ -202,6 +202,12 @@ FROM staging.stg_institutions si
 WHERE nullif(btrim(bkclass), '') IS NOT NULL
 ON conflict (charter_code) DO NOTHING;
 
+INSERT INTO charter_class (charter_code)
+SELECT DISTINCT upper(btrim(chclass1))
+FROM staging.stg_failures sf
+WHERE nullif(btrim(sf.chclass1), '') IS NOT NULL
+ON CONFLICT (charter_code) DO NOTHING;
+
 INSERT INTO holding_company (holding_company_name)
 SELECT DISTINCT btrim(si.namehcr )
 FROM staging.stg_institutions si
@@ -213,6 +219,12 @@ SELECT DISTINCT btrim(sc.harmonized_product )
 FROM staging.stg_complaints sc
 WHERE nullif(btrim(harmonized_product), '') IS NOT NULL
 ON conflict (product_name) DO NOTHING;
+
+INSERT INTO sub_product (sub_product_name)
+SELECT DISTINCT btrim(sc.sub_product )
+FROM staging.stg_complaints sc
+WHERE nullif(btrim(sub_product), '') IS NOT NULL
+ON CONFLICT (sub_product_name) DO NOTHING ;
 
 INSERT INTO issue (issue_name)
 SELECT DISTINCT btrim(issue)
@@ -280,7 +292,7 @@ INSERT INTO institution(
 
 INSERT INTO financial_observation(
 	cert,
-	repdte,
+	quarter_date,
 	fiscal_year,
 	fiscal_quarter,
 	netinc_ytd,
@@ -302,7 +314,7 @@ INSERT INTO financial_observation(
 	total_deposits)
 	SELECT
 		btrim(sf.cert),
-		sf.repdte ,
+		sf.quarter_date  ,
 		sf."year",
 		sf.quarter ,
 		sf.netinc ,
@@ -321,10 +333,8 @@ INSERT INTO financial_observation(
 		sf.roe ,
 		sf.nimy ,
 		sf.asset ,
-		sf.depdom
-	FROM staging.stg_financials sf
-	JOIN warehouse.institution i
-		ON i.cert = btrim(sf.cert );
+		sf.dep
+	FROM staging.stg_financials sf;
 
 INSERT INTO failure_event (
 	cert,
@@ -352,7 +362,7 @@ INSERT INTO failure_event (
 	LEFT JOIN warehouse.institution i
 		ON i.cert = nullif(btrim(sf.cert ), '')
 	LEFT JOIN warehouse.state s
-		ON s.state_code = upper(btrim(s.state_code ));
+		ON s.state_code = sf.bidstate ;
 
 INSERT INTO cfpb_company (
 	company_name)
@@ -361,11 +371,10 @@ INSERT INTO cfpb_company (
 		SELECT company AS company_name
 		FROM staging.stg_complaints sc
 		UNION
-		SELECT company
+		SELECT sc.company_name_normalized
 		FROM staging.stg_crosswalk sc ) companies
 	WHERE nullif(btrim(company_name), '') IS NOT NULL
 	ON CONFLICT  (company_name) DO NOTHING;
-
 
 INSERT INTO company_bank_match(
 	company_id,
@@ -376,44 +385,16 @@ INSERT INTO company_bank_match(
 SELECT
 	co.company_id,
 	i.cert,
-	CASE
-		WHEN i.cert IS NULL THEN hc.holding_company_id END,
-	CASE
-		WHEN i.cert IS NOT NULL THEN
-		CASE
-			WHEN lower(COALESCE(x.match_method, '')) = 'manual'
-				THEN 'manual'
-			WHEN lower(COALESCE(x.match_method, '')) = 'rule'
-				THEN 'rule'
-			ELSE 'exact'
-		END
-		WHEN hc.holding_company_id IS NOT NULL THEN
-			CASE
-				WHEN lower(COALESCE(x.match_method, '')) = 'manual'
-					THEN 'manual'
-				WHEN lower(COALESCE(x.match_method, '')) = 'rule'
-					THEN 'rule'
-				ELSE 'exact'
-			END
-		ELSE 'unmatched'
-	END,
-	CASE
-		WHEN i.cert IS NULL AND hc.holding_company_id IS NULL THEN
-			CASE
-				WHEN lower(COALESCE(x.category, ''))
-					IN ('credit bureau', 'auto finance', 'fintech or payments', 'mortgage or lender', 'other lender')
-					THEN lower(x.category)
-				ELSE 'unknown'
-			END
-		ELSE NULL
-	END
+	i.holding_company_id,
+	sc.match_method ,
+	sc.company_category
 FROM warehouse.cfpb_company co
-LEFT JOIN staging.stg_crosswalk x
-	ON btrim(x.company) = co.company_name
+RIGHT JOIN staging.stg_crosswalk sc
+	ON btrim(sc.company_name) = co.company_name
 LEFT JOIN warehouse.institution i
-	ON i.cert = nullif(btrim(x.cert), '')
+	ON i.cert = nullif(btrim(sc.matched_fdic_certificate_number ), '')
 LEFT JOIN warehouse.holding_company hc
-	ON hc.holding_company_name = nullif(btrim(x.namehcr), '');
+	ON hc.holding_company_name = nullif(btrim(sc.holding_company), '');
 
 INSERT INTO complaint (
 	complaint_id,
@@ -488,5 +469,33 @@ SELECT
 	sm.dgs10
 FROM staging.stg_macro sm ;
 
+--INSERT INTO sub_product (sub_product_name)
+--SELECT DISTINCT btrim(sc.sub_product )
+--FROM staging.stg_complaints sc
+--WHERE nullif(btrim(sub_product), '') IS NOT NULL
+--ON CONFLICT (sub_product_name) DO NOTHING ;
+
+SELECT
+	(SELECT count(*) FROM warehouse.cfpb_company) AS cfpb_company_count,
+	(SELECT count(*) FROM warehouse.charter_class) AS charter_count,
+	(SELECT count(*) FROM warehouse.company_bank_match) AS match_count,
+	(SELECT count(*) FROM warehouse.complaint) AS complaint_count,
+	(SELECT count(*) FROM warehouse.consumer_response) AS c_response_count,
+	(SELECT count(*) FROM warehouse.failure_event) AS failure_count,
+	(SELECT count(*) FROM warehouse.financial_observation) AS financial_count,
+	(SELECT count(*) FROM warehouse.fred_macro) AS macro_count,
+	(SELECT count(*) FROM warehouse.holding_company) AS holding_count,
+	(SELECT count(*) FROM warehouse.institution) AS inst_count,
+	(SELECT count(*) FROM warehouse.issue) AS issue_count,
+	(SELECT count(*) FROM warehouse.product) AS product_count,
+	(SELECT count(*) FROM warehouse.public_response) AS p_response_count,
+	(SELECT count(*) FROM warehouse.state) AS state_count,
+	(SELECT count(*) FROM warehouse.sub_issue) AS sub_i_count,
+	(SELECT count(*) FROM warehouse.sub_product) AS sub_product_count,
+	(SELECT count(*) FROM warehouse.submission_channel) AS submission_count;
+
+
+SELECT DISTINCT chclass1
+FROM staging.stg_failures sf ;
 
 

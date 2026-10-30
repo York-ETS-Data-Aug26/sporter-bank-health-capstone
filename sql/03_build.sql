@@ -1,24 +1,25 @@
 \set ON_ERROR_STOP on
 SET client_min_messages = warning;
 
-DROP SCHEMA mart CASCADE;
-CREATE SCHEMA IF NOT EXISTS mart;
+BEGIN;
 
--- tables for mart as to be able to store data used regularly
+DROP SCHEMA IF EXISTS mart CASCADE;
+CREATE SCHEMA IF NOT EXISTS mart;
 
 SET search_path TO mart;
 
-BEGIN;
+
 
 DROP TABLE IF EXISTS
 	fact_industry_quarter,
-	fact_bank_quarter,
+	fact_charter_quarter,
+	fact_holding_company_quarter,
 	fact_complaint,
 	dim_company,
 	dim_response,
 	dim_channel,
 	dim_product,
-	dmi_state,
+	dim_state,
 	dim_bank,
 	dim_date
 CASCADE;
@@ -42,7 +43,7 @@ WITH bounds AS (
 		date '1934-01-01' AS start_date,
 		GREATEST(
 			COALESCE (
-				(SELECT max(repdte)
+				(SELECT max(quarter_date)
 				FROM warehouse.financial_observation fo ),
 				date '2026-06-30'
 			),
@@ -128,12 +129,13 @@ SELECT
 	i.holding_company_id ,
 	i.institituion_name  ,
 	cc.charter_code,
-	i.state_number ,
+	s.state_code  ,
 	i.active
 FROM warehouse.institution i
 LEFT JOIN warehouse.charter_class cc
 	ON cc.charter_class_id = i.charter_class_id
-WHERE i.holding_company_id IS NOT NULL;
+LEFT JOIN warehouse.state s
+	ON s.state_number = i.state_number  ;
 
 INSERT INTO dim_bank(
 	bank_entity_type,
@@ -153,6 +155,19 @@ SELECT
 	NULL
 FROM warehouse.holding_company hc ;
 
+ALTER TABLE dim_bank
+ADD COLUMN parent_bank_key bigint REFERENCES dim_bank(bank_key);
+
+UPDATE mart.dim_bank db
+SET parent_bank_key = db2.bank_key
+FROM warehouse.institution i
+JOIN mart.dim_bank db2
+	ON db2.bank_entity_type = 'holding_company'
+	AND db2.holding_company_id = i.holding_company_id
+WHERE db.bank_entity_type = 'charter'
+	AND db.cert = i.cert
+	AND db.holding_company_id IS NOT NULL ;
+
 CREATE TABLE dim_company (
 	company_key bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
 	company_id bigint NOT NULL UNIQUE,
@@ -171,7 +186,7 @@ INSERT INTO dim_company (
 SELECT
 	cc.company_id,
 	cc.company_name ,
-	coalesce(cbm.match_method , 'unmatched'),
+	cbm.match_method ,
 	cbm.unmatched_category,
 	CASE
 		WHEN cbm.institution_cert IS NOT NULL
@@ -181,7 +196,7 @@ SELECT
 		ELSE NULL
 	END
 FROM warehouse.cfpb_company cc
-LEFT JOIN warehouse.company_bank_match cbm
+RIGHT JOIN warehouse.company_bank_match cbm
 	ON cbm.company_id = cc.company_id
 LEFT JOIN mart.dim_bank db
 	ON db.bank_entity_type = 'charter'
@@ -192,14 +207,20 @@ LEFT JOIN mart.dim_bank db2
 
 CREATE TABLE dim_product (
 	product_key bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-	product_id bigint NOT NULL UNIQUE,
 	product_name text NOT NULL UNIQUE);
 
-INSERT INTO dim_product(
-	product_id,
-	product_name)
+CREATE TABLE dim_sub_product (
+	sub_product_key bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+	sub_product_name text NOT NULL UNIQUE);
+
+INSERT INTO dim_sub_product (sub_product_name)
 SELECT
-	p.product_id ,
+	sp.sub_product_name
+FROM warehouse.sub_product sp;
+
+
+INSERT INTO dim_product(product_name)
+SELECT
 	p.product_name
 FROM warehouse.product p;
 
@@ -207,8 +228,7 @@ CREATE TABLE dim_state (
 	state_key bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
 	state_code text NOT NULL UNIQUE);
 
-INSERT INTO dim_state (
-	state_code)
+INSERT INTO dim_state (state_code)
 SELECT
 	s.state_code
 FROM warehouse.state s ;
@@ -256,11 +276,11 @@ CREATE TABLE fact_complaint (
 	company_key bigint NOT NULL REFERENCES dim_company(company_key),
 	bank_key bigint REFERENCES dim_bank(bank_key),
 	product_key bigint REFERENCES dim_product(product_key),
-	state_key bigint REFERENCES dim_state(state_key),
+	state_code text REFERENCES dim_state(state_code),
 	response_key bigint REFERENCES dim_response(response_key),
 	channel_key bigint REFERENCES dim_channel(channel_key),
 	date_sent_to_company date,
-	sub_product text,
+	sub_product_key bigint REFERENCES dim_sub_product(sub_product_key),
 	issue text,
 	sub_issue text,
 	zip_code text,
@@ -274,11 +294,11 @@ INSERT INTO fact_complaint (
 	company_key,
 	bank_key,
 	product_key,
-	state_key,
+	state_code,
 	response_key,
 	channel_key,
 	date_sent_to_company,
-	sub_product,
+	sub_product_key,
 	issue,
 	sub_issue,
 	zip_code,
@@ -289,11 +309,11 @@ SELECT
 	dc.company_key ,
 	dc.matched_bank_key ,
 	dp.product_key ,
-	s.state_number,
+	ds.state_code,
 	dr.response_key ,
-	ch.channel_key,
+	c.channel_id,
 	c.date_sent_to_company ,
-	sp.sub_product_name,
+	c.sub_product_id,
 	iss.issue_name,
 	si.sub_issue_name,
 	c.zip_code ,
@@ -302,11 +322,9 @@ FROM warehouse.complaint c
 JOIN mart.dim_company dc
 	ON dc.company_id = c.company_id
 LEFT JOIN mart.dim_product dp
-	ON dp.product_id = c.product_id
-LEFT JOIN warehouse.state s
-	ON s.state_number  = c.state_number
+	ON dp.product_key = c.product_id
 LEFT JOIN mart.dim_state ds
-	ON ds.state_code = s.state_code
+	ON ds.state_key  = c.state_number
 LEFT JOIN warehouse.public_response pr
 	ON pr.public_response_id = c.public_response_id
 LEFT JOIN warehouse.consumer_response cr
@@ -317,156 +335,87 @@ LEFT JOIN mart.dim_response dr
 	AND dr.timely_response IS NOT DISTINCT FROM c.timely_response
 LEFT JOIN warehouse.submission_channel sc
 	ON sc.channel_id = c.channel_id
-LEFT JOIN mart.dim_channel ch
-	ON ch.channel_id = sc.channel_id
-LEFT JOIN warehouse.sub_product sp
-	ON sp.sub_product_id = c.sub_product_id
 LEFT JOIN warehouse.issue iss
 	ON iss.issue_id = c.issue_id
 LEFT JOIN warehouse.sub_issue si
 	ON si.sub_issue_id = c.sub_issue_id;
-
-CREATE TABLE fact_bank_quarter (
-	bank_key bigint NOT NULL REFERENCES dim_bank(bank_key),
-	date_key integer NOT NULL REFERENCES dim_date(date_key),
-	netinc_ytd NUMERIC (20,3),
-	netinc_qtr NUMERIC (20,3),
-	intinc_ytd NUMERIC (20,3),
-	intinc_qtr NUMERIC (20,3),
-	eintexp_ytd NUMERIC (20,3),
-	eintexp_qtr NUMERIC (20,3),
-	nonii_ytd NUMERIC (20,3),
-	nonii_qtr NUMERIC  (20,3),
-	nonix_ytd NUMERIC (20,3),
-	nonix_qtr NUMERIC (20,3),
-	elnatr_ytd NUMERIC  (20,3),
-	elnatr_qtr NUMERIC (20,3),
-	roa NUMERIC  (12,6),
-	roe NUMERIC (12,6),
-	nimy NUMERIC (12,6),
-	total_assets NUMERIC (20,3),
-	total_deposits NUMERIC (20,3),
-	fedfunds NUMERIC (12,6),
-	unrate NUMERIC (12,6),
-	mortgage30us NUMERIC (12,6),
-	dgs10 NUMERIC (12,6),
-	PRIMARY KEY (bank_key, date_key)
+--ROLLBACK;
+-- 1. Charter Fact Table
+CREATE TABLE fact_charter_quarter (
+    bank_key bigint NOT NULL REFERENCES dim_bank(bank_key),
+    date_key integer NOT NULL REFERENCES dim_date(date_key),
+    netinc_ytd NUMERIC (20,3), netinc_qtr NUMERIC (20,3),
+    intinc_ytd NUMERIC (20,3), intinc_qtr NUMERIC (20,3),
+    eintexp_ytd NUMERIC (20,3), eintexp_qtr NUMERIC (20,3),
+    nonii_ytd NUMERIC (20,3), nonii_qtr NUMERIC (20,3),
+    nonix_ytd NUMERIC (20,3), nonix_qtr NUMERIC (20,3),
+    elnatr_ytd NUMERIC (20,3), elnatr_qtr NUMERIC (20,3),
+    roa NUMERIC (12,6), roe NUMERIC (12,6), nimy NUMERIC (12,6),
+    total_assets NUMERIC (20,3), total_deposits NUMERIC (20,3),
+    fedfunds NUMERIC (12,6), unrate NUMERIC (12,6),
+    mortgage30us NUMERIC (12,6), dgs10 NUMERIC (12,6),
+    PRIMARY KEY (bank_key, date_key)
 );
 
-INSERT INTO fact_bank_quarter (
-	bank_key,
-	date_key,
-	netinc_ytd,
-	netinc_qtr,
-	intinc_ytd,
-	intinc_qtr,
-	eintexp_ytd,
-	eintexp_qtr,
-	nonii_ytd,
-	nonii_qtr,
-	nonix_ytd,
-	nonix_qtr,
-	elnatr_ytd,
-	elnatr_qtr,
-	roa,
-	roe,
-	nimy,
-	total_assets,
-	total_deposits,
-	fedfunds,
-	unrate,
-	mortgage30us,
-	dgs10)
-SELECT
-	db.bank_key ,
-	to_char(fo.repdte, 'YYYYMMDD' )::integer,
-	fo.netinc_ytd ,
-	fo.netinc_qtr,
-	fo.intinc_ytd ,
-	fo.intinc_qtr ,
-	fo.eintexp_ytd ,
-	fo.eintexp_qtr ,
-	fo.nonii_ytd ,
-	fo.nonii_qtr ,
-	fo.nonix_ytd ,
-	fo.nonix_qtr ,
-	fo.elnatr_ytd ,
-	fo.elnatr_qtr ,
-	fo.roa ,
-	fo.roe ,
-	fo.nimy ,
-	fo.total_assets ,
-	fo.total_deposits ,
-	fm.fedfunds ,
-	fm.unrate ,
-	fm.mortgate30us ,
-	fm.dgs10
-FROM warehouse.financial_observation fo
-LEFT JOIN mart.dim_bank db
-	ON  db.cert = fo.cert
-LEFT JOIN warehouse.fred_macro fm
-	ON fm.quarter_end = fo.repdte
-WHERE db.bank_entity_type = 'charter'
-	AND fo.cert = db.cert ;
+-- 2. Holding Company Fact Table
+-- (Note: removed metrics like roa/roe/nimy that cannot be mathematically summed)
+CREATE TABLE fact_holding_company_quarter (
+    bank_key bigint NOT NULL REFERENCES dim_bank(bank_key),
+    date_key integer NOT NULL REFERENCES dim_date(date_key),
+    netinc_ytd NUMERIC (20,3), netinc_qtr NUMERIC (20,3),
+    intinc_ytd NUMERIC (20,3), intinc_qtr NUMERIC (20,3),
+    eintexp_ytd NUMERIC (20,3), eintexp_qtr NUMERIC (20,3),
+    nonii_ytd NUMERIC (20,3), nonii_qtr NUMERIC (20,3),
+    nonix_ytd NUMERIC (20,3), nonix_qtr NUMERIC (20,3),
+    elnatr_ytd NUMERIC (20,3), elnatr_qtr NUMERIC (20,3),
+    total_assets NUMERIC (20,3), total_deposits NUMERIC (20,3),
+    fedfunds NUMERIC (12,6), unrate NUMERIC (12,6),
+    mortgage30us NUMERIC (12,6), dgs10 NUMERIC (12,6),
+    PRIMARY KEY (bank_key, date_key)
+);
 
-INSERT INTO fact_bank_quarter (
-	bank_key,
-	date_key,
-	netinc_ytd,
-	netinc_qtr,
-	intinc_ytd,
-	intinc_qtr,
-	eintexp_ytd,
-	eintexp_qtr,
-	nonii_ytd,
-	nonii_qtr,
-	nonix_ytd,
-	nonix_qtr,
-	elnatr_ytd,
-	elnatr_qtr,
-	roa,
-	roe,
-	nimy,
-	total_assets,
-	total_deposits,
-	fedfunds,
-	unrate,
-	mortgage30us,
-	dgs10)
+-- Target 1: Populating Charter Level Metrics
+INSERT INTO fact_charter_quarter (
+    bank_key, date_key, netinc_ytd, netinc_qtr, intinc_ytd, intinc_qtr,
+    eintexp_ytd, eintexp_qtr, nonii_ytd, nonii_qtr, nonix_ytd, nonix_qtr,
+    elnatr_ytd, elnatr_qtr, roa, roe, nimy, total_assets, total_deposits,
+    fedfunds, unrate, mortgage30us, dgs10
+)
 SELECT
-	db.bank_key ,
-	to_char(fo.repdte, 'YYYYMMDD' )::integer,
-	sum (fo.netinc_ytd) ,
-	sum (fo.netinc_qtr),
-	sum (fo.intinc_ytd ),
-	sum (fo.intinc_qtr ),
-	sum (fo.eintexp_ytd ),
-	sum (fo.eintexp_qtr ),
-	sum (fo.nonii_ytd ),
-	sum (fo.nonii_qtr) ,
-	sum (fo.nonix_ytd ),
-	sum (fo.nonix_qtr ),
-	sum (fo.elnatr_ytd ),
-	sum (fo.elnatr_qtr ),
-	NULL ,
-	NULL ,
-	NULL,
-	sum (fo.total_assets) ,
-	sum (fo.total_deposits ),
-	max (fm.fedfunds) ,
-	max (fm.unrate) ,
-	max (fm.mortgate30us) ,
-	max (fm.dgs10)
+    db.bank_key,
+    to_char(fo.quarter_date, 'YYYYMMDD')::integer,
+    fo.netinc_ytd, fo.netinc_qtr, fo.intinc_ytd, fo.intinc_qtr,
+    fo.eintexp_ytd, fo.eintexp_qtr, fo.nonii_ytd, fo.nonii_qtr,
+    fo.nonix_ytd, fo.nonix_qtr, fo.elnatr_ytd, fo.elnatr_qtr,
+    fo.roa, fo.roe, fo.nimy, fo.total_assets, fo.total_deposits,
+    fm.fedfunds, fm.unrate, fm.mortgate30us, fm.dgs10
 FROM warehouse.financial_observation fo
-JOIN warehouse.institution i
-	ON i.cert = fo.cert
-LEFT JOIN mart.dim_bank db
-	ON db.bank_entity_type = 'holding_company'
-	AND db.holding_company_id = i.holding_company_id
-LEFT JOIN warehouse.fred_macro fm
-	ON fm.quarter_end = fo.repdte
-WHERE db.bank_key IS NOT NULL
-GROUP BY db.bank_key , fo.repdte ;
+LEFT JOIN mart.dim_bank db ON db.cert = fo.cert
+LEFT JOIN warehouse.fred_macro fm ON fm.quarter_end = fo.quarter_date
+WHERE db.bank_entity_type = 'charter' AND fo.cert = db.cert;
+
+
+-- Target 2: Populating Aggregated Holding Company Level Metrics
+INSERT INTO fact_holding_company_quarter (
+    bank_key, date_key, netinc_ytd, netinc_qtr, intinc_ytd, intinc_qtr,
+    eintexp_ytd, eintexp_qtr, nonii_ytd, nonii_qtr, nonix_ytd, nonix_qtr,
+    elnatr_ytd, elnatr_qtr, total_assets, total_deposits,
+    fedfunds, unrate, mortgage30us, dgs10
+)
+SELECT
+    db.bank_key,
+    to_char(fo.quarter_date, 'YYYYMMDD')::integer,
+    sum(fo.netinc_ytd), sum(fo.netinc_qtr), sum(fo.intinc_ytd), sum(fo.intinc_qtr),
+    sum(fo.eintexp_ytd), sum(fo.eintexp_qtr), sum(fo.nonii_ytd), sum(fo.nonii_qtr),
+    sum(fo.nonix_ytd), sum(fo.nonix_qtr), sum(fo.elnatr_ytd), sum(fo.elnatr_qtr),
+    sum(fo.total_assets), sum(fo.total_deposits),
+    max(fm.fedfunds), max(fm.unrate), max(fm.mortgate30us), max(fm.dgs10)
+FROM warehouse.financial_observation fo
+LEFT JOIN warehouse.institution i ON i.cert = fo.cert
+LEFT JOIN mart.dim_bank db ON db.bank_entity_type = 'holding_company' AND db.holding_company_id = i.holding_company_id
+LEFT JOIN warehouse.fred_macro fm ON fm.quarter_end = fo.quarter_date
+WHERE db.bank_key IS NOT NULL AND db.parent_bank_key IS NULL
+GROUP BY db.bank_key, fo.quarter_date;
 
 CREATE TABLE fact_industry_quarter (
 	date_key integer PRIMARY KEY REFERENCES dim_date(date_key),
@@ -485,13 +434,13 @@ CREATE TABLE fact_industry_quarter (
 
 WITH financial_summary AS (
 	SELECT
-		fo.repdte ,
+		fo.quarter_date ,
 		count(DISTINCT fo.cert )::integer AS institution_count,
 		sum (fo.total_assets ) AS total_assets,
 		sum(fo.total_deposits ) AS total_deposits,
 		sum(fo.netinc_qtr ) AS netinc_qtr
 	FROM warehouse.financial_observation fo
-	GROUP BY fo.repdte
+	GROUP BY fo.quarter_date
 ),
 complaint_summary AS (
 	SELECT
@@ -516,7 +465,7 @@ INSERT INTO fact_industry_quarter (
 	mortgage30us,
 	dgs10)
 SELECT
-	to_char(fs.repdte, 'YYYYMMDD')::integer,
+	to_char(fs.quarter_date, 'YYYYMMDD')::integer,
 	FS.institution_count,
 	FS.total_assets,
 	FS.total_deposits,
@@ -529,9 +478,9 @@ SELECT
 	m.dgs10
 FROM financial_summary FS
 LEFT JOIN complaint_summary cs
-	ON cs.quarter_end = FS.repdte
+	ON cs.quarter_end = FS.quarter_date
 LEFT JOIN warehouse.fred_macro m
-	ON m.quarter_end = FS.repdte;
+	ON m.quarter_end = FS.quarter_date;
 
 CREATE TABLE fact_failure (
 	failure_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -568,17 +517,24 @@ LEFT JOIN mart.dim_bank db
 	ON db.bank_entity_type = 'charter'
 	AND db.cert = fe.cert ;
 
-ALTER TABLE dim_bank
-ADD COLUMN parent_bank_key bigint REFERENCES dim_bank(bank_key);
-
-UPDATE mart.dim_bank db
-SET parent_bank_key = db.bank_key
-FROM warehouse.institution i
-JOIN mart.dim_bank db2
-	ON db2.bank_entity_type = 'holding_company'
-	AND db2.holding_company_id = i.holding_company_id
-WHERE db.bank_entity_type = 'charter'
-	AND db.cert = i.cert
-	AND db.holding_company_id IS NOT NULL ;
-
 COMMIT;
+
+SELECT
+	(SELECT count(*) FROM mart.dim_bank) AS bank_count,
+	(SELECT count(*) FROM mart.dim_channel) AS channel_count,
+	(SELECT count(*) FROM mart.dim_company) AS company_count,
+	(SELECT count(*) FROM mart.dim_date) AS date_count,
+	(SELECT count(*) FROM mart.dim_product) AS product_count,
+	(SELECT count(*) FROM mart.dim_response) AS response_count,
+	(SELECT count(*) FROM mart.dim_state) AS state_count,
+	(SELECT count(*) FROM mart.fact_charter_quarter) AS charter_count,
+	(SELECT count(*) FROM mart.fact_complaint) AS complaint_count,
+	(SELECT count(*) FROM mart.fact_failure) AS failure_count,
+	(SELECT count(*) FROM mart.fact_holding_company_quarter) AS holding_count,
+	(SELECT count(*) FROM mart.fact_industry_quarter) AS industry_count;
+
+SELECT count(*)
+FROM warehouse.financial_observation fo ;
+
+
+SELECT count(*) FROM mart.fact_complaint;

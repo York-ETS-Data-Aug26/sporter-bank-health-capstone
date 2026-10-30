@@ -334,7 +334,7 @@ def clean_complaints():
         product_map = {
             'Checking or savings account': 'Bank Account',
             'Mortgage': 'Mortgage',
-            'Credit Card': 'Credit Card',
+            'Credit card': 'Credit Card',
             'Payday loan, title loan, personal loan, or advance loan': 'Loan',
             'Vehicle loan or lease': 'Vehicle Loan',
         }
@@ -376,7 +376,7 @@ def crosswalk_table(complaints_df, instiution_df):
      'L.P.',
      'SAVINGS',
      'BCORP',
-     'THE'
+     'THE',
      'ASSOCIATION',
     }
 
